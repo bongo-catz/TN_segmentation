@@ -5,7 +5,7 @@ This repository contains code for multi-stage rigid and non-rigid registration o
 The pipeline supports preprocessing (including N4 bias field correction and intensity normalization), affine/B-spline registration, mask generation from annotated centroids, and visualization of results for manual inspection and region confirmation.
 
 ## Repository Structure
-
+```
 TN_segmentation/
 ├── requirements.txt # Python dependencies
 ├── environment.yml # Conda environment file
@@ -26,6 +26,7 @@ TN_segmentation/
 │ ├── <patient_id>/ # Patient-specific folders
 │ │ ├── <patient_id>_MRI/
 │ │ ├── <patient_id>_MRA/
+```
 
 ## Setup
 
@@ -55,22 +56,3 @@ python scripts/alignment_v2.py \
   --centroid-locations data/centroids/<year>_centroids.csv \
   --logfile output/<patient_id>/alignment.log
 ```
-
-Required Arguments
---mri: Path to MRI .nii.gz image
-
---mra: Path to MRA .nii.gz image
-
---output: Path to save the final aligned image
-
---patient-mrn: The patient ID (used to lookup centroid annotations)
-
---initial-transform: Type of transform for initial alignment (euler, similarity, affine, versor, bspline)
-
---initial-spacing: B-spline control point spacing (in mm) for the initial transform
-
---final-spacing: B-spline spacing (in mm) for localized fine-tuning
-
---centroid-locations: Path to CSV file containing centroid annotations
-
---logfile: Optional. Path to save log output (defaults to stdout if not provided)
