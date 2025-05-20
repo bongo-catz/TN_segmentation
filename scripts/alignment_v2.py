@@ -1,4 +1,5 @@
 import SimpleITK as sitk
+import itk
 import numpy as np
 import argparse
 import tkinter as tk
@@ -12,15 +13,14 @@ import os
 import csv
 from helper_class.region_selector import RegionSelector
 from helper_class.region_viewer import RegionViewer
+from typing import Tuple
+
 import subprocess
 import antspynet
 from antspynet.utilities import brain_extraction as antspynet_brain_extraction
 import ants
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
-
-# TO DO:
-# 1) Do brain extraction (remove mask of skull)
 
 def load_image(file_path):
     """Load a NIfTI image (.nii.gz) and return a SimpleITK image object."""
@@ -233,7 +233,7 @@ def perform_initial_registration(fixed_image, moving_image, transform_type='eule
         # Set up similarity metric
         registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
         registration.SetMetricSamplingStrategy(registration.RANDOM)
-        registration.SetMetricSamplingPercentage(0.01)
+        registration.SetMetricSamplingPercentage(0.01, seed=42)
         
         registration.SetInterpolator(sitk.sitkLinear)
         
@@ -290,7 +290,7 @@ def perform_nonrigid_registration(fixed_image, moving_image, mask, grid_spacing=
         # Set up similarity metric
         registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)
         registration.SetMetricSamplingStrategy(registration.RANDOM)
-        registration.SetMetricSamplingPercentage(0.4)
+        registration.SetMetricSamplingPercentage(0.4, seed=42)
         
         # Set multi-resolution
         registration.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
@@ -349,64 +349,59 @@ def perform_nonrigid_registration_v2(fixed_image, moving_image, mask, grid_spaci
         # Vessel-specific preprocessing for MRA
         moving_processed = vessel_enhancement_filter(moving_image)
         
-        # Anatomical preservation for MRI
-        fixed_processed = anatomical_preservation_filter(fixed_image)
+        # ===== 2. ADVANCED TRANSFORM CONFIGURATION =====
+        transform_mesh_size = calculate_grid_size(fixed_image, grid_spacing)
+        bspline = sitk.BSplineTransformInitializer(fixed_image, transform_mesh_size)
         
-        # ===== 2. MASK OPTIMIZATION =====
-        # Dilate mask for boundary tolerance (3mm dilation)
-        dilated_mask = sitk.BinaryDilate(mask, [3]*mask.GetDimension())
-        registration.SetMetricFixedMask(dilated_mask)
-        
-        # ===== 3. ADVANCED TRANSFORM CONFIGURATION =====
-        transform_mesh_size = calculate_grid_size(fixed_processed, grid_spacing)
-        bspline = sitk.BSplineTransformInitializer(fixed_processed, transform_mesh_size)
-        
-        # ===== 4. IMPROVED REGISTRATION SETTINGS =====
+        # ===== 3. IMPROVED REGISTRATION SETTINGS =====
         registration = sitk.ImageRegistrationMethod()
-        registration.SetInitialTransform(bspline, inPlace=False)
+        registration.SetInitialTransform(bspline)
+        registration.SetMetricFixedMask(mask)
         
-        # Multi-resolution strategy
-        registration.SetShrinkFactorsPerLevel([8, 4, 2, 1])
-        registration.SetSmoothingSigmasPerLevel([4.0, 2.0, 1.0, 0.0])
+        # Set up similarity metric
+        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)
+        registration.SetMetricSamplingStrategy(registration.RANDOM)
+        registration.SetMetricSamplingPercentage(0.4, seed=42)
+        
+        # Set multi-resolution
+        registration.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+        registration.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
         registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
-        # ===== 5. VASCULAR-OPTIMIZED METRIC =====
-        registration.SetMetricAsJointHistogramMutualInformation(
-            numberOfHistogramBins=64,
-            varianceForJointPDFSmoothing=1.5
-        )
-        registration.SetMetricSamplingStrategy(registration.ADAPTIVE)
-        registration.SetMetricSamplingPercentage(0.25)
-
-        # ===== 6. REGULARIZATION =====
-        registration.SetMetricUseRegularization(True)
-        registration.SetMetricBendingEnergyWeight(0.8)  # Controls surface smoothness
-        registration.SetMetricLinearElasticityWeight(0.2)  # Preserves topology
-
-        # ===== 7. OPTIMIZER IMPROVEMENTS =====
-        registration.SetOptimizerAsConjugateGradientLineSearch(
-            learningRate=1.5,
-            numberOfIterations=200,
-            convergenceMinimumValue=1e-6,
-            convergenceWindowSize=20
-        )
-
-        # ===== 8. ENHANCED MONITORING =====
-        def log_iteration(method):
-            if method.GetOptimizerIteration() % 10 == 0:
-                log.info(
-                    f"Iter {method.GetOptimizerIteration():03d}: "
-                    f"Metric={method.GetMetricValue():.4f} "
-                    f"LearningRate={method.GetOptimizerLearningRate():.3f}"
-                )
-        registration.AddCommand(sitk.sitkIterationEvent, log_iteration)
-
-        # ===== 9. EXECUTE REGISTRATION =====
-        final_transform = registration.Execute(fixed_processed, moving_processed)
+        # Set linear interpolator
+        registration.SetInterpolator(sitk.sitkLinear)
         
-        # ===== 10. POST-REGISTRATION ANALYSIS =====
-        transformed_image = sitk.Resample(moving_image, fixed_image, final_transform)
-        analyze_alignment_quality(fixed_image, transformed_image, dilated_mask)
+        # Set linear interpolator
+        registration.SetInterpolator(sitk.sitkLinear)
+        
+        # Optimizer for non-rigid registration
+        registration.SetOptimizerAsLBFGSB(
+            gradientConvergenceTolerance=1e-5,
+            numberOfIterations=75,
+            maximumNumberOfCorrections=5,
+            maximumNumberOfFunctionEvaluations=1000,
+            costFunctionConvergenceFactor=1e7)
+        
+        # Add observers to track progress
+        def command_iteration(method):
+            log.info(f"Iteration {method.GetOptimizerIteration()}: "
+                  f"Metric = {method.GetMetricValue():.6f}")
+            
+        registration.AddCommand(sitk.sitkIterationEvent, 
+                              lambda: command_iteration(registration))
+
+        # ===== 7. EXECUTE REGISTRATION =====
+        moving_processed = sitk.Cast(moving_processed, sitk.sitkFloat32)
+        final_transform = registration.Execute(fixed_image, moving_processed)
+        
+        # ===== 8. POST-REGISTRATION ANALYSIS =====
+        transformed_image = sitk.Resample(moving_image, 
+                                          fixed_image, 
+                                          final_transform, 
+                                          sitk.sitkLinear,
+                                          0.0,
+                                          sitk.sitkFloat32)
+        # analyze_alignment_quality(fixed_image, transformed_image, mask)
 
         return transformed_image, final_transform
 
@@ -414,25 +409,65 @@ def perform_nonrigid_registration_v2(fixed_image, moving_image, mask, grid_spaci
         log.error(f"Registration failed: {str(e)}")
         return None, None
 
-# New helper functions -------------------------------------------------
+# New helper functions for non_rigid_registration_v2 -------------------------------------------------
 
-def vessel_enhancement_filter(image):
-    """Enhance vascular structures in MRA images."""
-    # Multi-scale vesselness filtering
-    vessel_filter = sitk.HessianToObjectnessMeasureImageFilter()
-    vessel_filter.SetObjectDimension(1)
-    vessel_filter.SetBrightObject(True)
-    
-    enhanced = sitk.Image(image.GetSize(), sitk.sitkFloat32)
-    enhanced.CopyInformation(image)
-    
-    for sigma in [0.5, 1.0, 1.5]:
-        smoothed = sitk.RecursiveGaussian(image, sigma=sigma)
-        vessels = vessel_filter.Execute(smoothed)
-        enhanced = sitk.Add(enhanced, vessels)
-    
-    # Combine with original image
-    return sitk.Cast(image, sitk.sitkFloat32) + enhanced
+def vessel_enhancement_filter(image_sitk: sitk.Image) -> sitk.Image:
+    """Enhanced vascular structure detection using ITK's multi-scale Hessian-based vesselness filter."""
+    try:
+        # Convert SimpleITK image to numpy array
+        image_np = sitk.GetArrayFromImage(image_sitk)
+        
+        # Define ITK types
+        Dimension = 3
+        InputPixelType = itk.F
+        InputImageType = itk.Image[InputPixelType, Dimension]
+        HessianPixelType = itk.SymmetricSecondRankTensor[itk.D, Dimension]
+        HessianImageType = itk.Image[HessianPixelType, Dimension]
+        
+        # Convert numpy array to ITK image
+        image_itk = itk.image_from_array(image_np.astype(np.float32))
+        image_itk.SetSpacing(image_sitk.GetSpacing())
+        image_itk.SetOrigin(image_sitk.GetOrigin())
+        image_itk.SetDirection(itk.GetMatrixFromArray(np.reshape(image_sitk.GetDirection(), (3, 3))))
+        
+        # Set up vesselness filter parameters
+        objectness_filter = itk.HessianToObjectnessMeasureImageFilter[
+            HessianImageType, InputImageType
+        ].New()
+        objectness_filter.SetBrightObject(True)  # For bright vessels on dark background
+        objectness_filter.SetScaleObjectnessMeasure(True)
+        objectness_filter.SetAlpha(0.5)  # Controls sensitivity to plate-like structures
+        objectness_filter.SetBeta(1.0)   # Controls sensitivity to blob-like structures
+        objectness_filter.SetGamma(5.0)  # Controls sensitivity to noise
+        
+        # Set up multi-scale filter
+        multi_scale_filter = itk.MultiScaleHessianBasedMeasureImageFilter[
+            InputImageType, HessianImageType, InputImageType
+        ].New()
+        multi_scale_filter.SetInput(image_itk)
+        multi_scale_filter.SetHessianToMeasureFilter(objectness_filter)
+        multi_scale_filter.SetSigmaStepMethodToLogarithmic()
+        multi_scale_filter.SetSigmaMinimum(0.5)   # Minimum scale (small vessels)
+        multi_scale_filter.SetSigmaMaximum(3.0)   # Maximum scale (large vessels)
+        multi_scale_filter.SetNumberOfSigmaSteps(4) # Number of scales
+        
+        # Execute the pipeline
+        multi_scale_filter.Update()
+        
+        # Convert back to SimpleITK
+        vesselness_np = itk.array_from_image(multi_scale_filter.GetOutput())
+        vesselness_sitk = sitk.GetImageFromArray(vesselness_np)
+        vesselness_sitk.CopyInformation(image_sitk)
+        
+        # Normalize the output
+        vesselness_sitk = sitk.RescaleIntensity(vesselness_sitk, 0, 1)
+        
+        return vesselness_sitk
+
+    except Exception as e:
+        log.error(f"Vessel enhancement failed: {str(e)}")
+        # Return original image if enhancement fails
+        return sitk.RescaleIntensity(image_sitk, 0, 1)
 
 def anatomical_preservation_filter(image):
     """Preprocess MRI to preserve anatomical structures."""
@@ -453,12 +488,16 @@ def anatomical_preservation_filter(image):
         outputMinimum=0.0,
         outputMaximum=1.0
     )
-
+    
 def analyze_alignment_quality(fixed, moved, mask):
     """Quantitative alignment assessment."""
     # Calculate Normalized Cross-Correlation
     ncc = sitk.NormalizedCorrelationImageFilter()
-    ncc_value = ncc.Execute(fixed, moved, mask)
+    ncc_value = ncc.Execute(
+        sitk.Cast(fixed, sitk.sitkFloat32),
+        sitk.Cast(moved, sitk.sitkFloat32),
+        sitk.Cast(mask, sitk.sitkFloat32)
+    )
     log.info(f"Alignment NCC: {ncc_value:.3f}")
 
     # Calculate deformation field magnitude
@@ -734,7 +773,7 @@ def main(mri, mra, output, patient_mrn, initial_transform, initial_spacing, fina
     
     # Perform non-rigid registration on selected region
     log.info("\nPerforming final non-rigid registration on selected region...")
-    aligned_image, nonrigid_transform = perform_nonrigid_registration_v2(
+    aligned_image, nonrigid_transform = perform_nonrigid_registration(
         mri_norm, initial_result, mask, grid_spacing=final_spacing)
     
     # Going to save the entire aligned image, not just region

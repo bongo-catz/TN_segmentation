@@ -14,3 +14,4 @@ dependencies:
     - pyyaml  # For configuration file handling 
     - antspyx # For brain extraction
     - antspynet 
+    - itk
