@@ -14,6 +14,7 @@ import csv
 from helper_class.region_selector import RegionSelector
 from helper_class.region_viewer import RegionViewer
 from typing import Tuple
+import napari
 
 import subprocess
 import antspynet
@@ -26,7 +27,9 @@ def load_image(file_path):
     """Load a NIfTI image (.nii.gz) and return a SimpleITK image object."""
     try:
         image = sitk.ReadImage(file_path)
-        image = sitk.Cast(image, sitk.sitkFloat32)
+        # First cast to float32 if it's an integer type
+        if image.GetPixelID() in [sitk.sitkInt16, sitk.sitkUInt16, sitk.sitkInt8, sitk.sitkUInt8]:
+            image = sitk.Cast(image, sitk.sitkFloat32)
         size = image.GetSize()
         spacing = image.GetSpacing()
         log.info(f"Loaded image {file_path}")
@@ -39,21 +42,71 @@ def load_image(file_path):
         log.info(f"Error loading image {file_path}: {str(e)}")
         sys.exit(1)
 
-def resample_to_reference(moving_image, reference_image):
-    """Resample moving image to match reference image resolution."""
+def resample_to_reference_centered(moving_image, reference_image):
+    """
+    First align centers using GEOMETRY method
+    """
     log.info("Resampling image to reference space...")
     log.info(f"Original size: {moving_image.GetSize()}")
     log.info(f"Original spacing: {moving_image.GetSpacing()}")
     
+    # === Step 1: Center-aligned initialization (GEOMETRY) ===
+    # First attempt with GEOMETRY (center alignment)
+    init_tf = sitk.CenteredTransformInitializer(
+        reference_image,
+        moving_image,
+        sitk.AffineTransform(3),
+        # sitk.Euler3DTransform(),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY
+    )
+    
+    # === Step 2: Resample the moving image into the reference space ===
+    # Resample to get initial overlap
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(reference_image)
+    resampler.SetTransform(init_tf)
     resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetTransform(sitk.Transform())
+    resampler.SetDefaultPixelValue(0)
+    initial_result = resampler.Execute(moving_image)
     
-    resampled = resampler.Execute(moving_image)
-    log.info(f"Resampled size: {resampled.GetSize()}")
-    log.info(f"Resampled spacing: {resampled.GetSpacing()}")
-    return resampled
+    log.info(f"Resampled size: {initial_result.GetSize()}")
+    log.info(f"Resampled spacing: {initial_result.GetSpacing()}")
+    return initial_result
+
+def resample_to_reference(moving_image, reference_image):
+    """Resample moving image to match reference image resolution."""
+    
+    log.info("Resampling image to reference space...")
+    log.info(f"Original size: {moving_image.GetSize()}")
+    log.info(f"Original spacing: {moving_image.GetSpacing()}")
+    
+    '''
+    init_tf = sitk.CenteredTransformInitializer(
+        reference_image,
+        moving_image,
+        sitk.AffineTransform(3),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY
+    )
+    '''
+    identity_centered = sitk.CenteredTransformInitializer(
+        reference_image,
+        moving_image,
+        sitk.Euler3DTransform(),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY  # use GEOMETRY to match orientation & spacing
+    )
+    
+    moving_image_resampled = sitk.Resample(
+        moving_image, 
+        reference_image, 
+        identity_centered, 
+        sitk.sitkLinear,
+        0,
+        moving_image.GetPixelID()
+    )
+    
+    log.info(f"Resampled size: {moving_image_resampled.GetSize()}")
+    log.info(f"Resampled spacing: {moving_image_resampled.GetSpacing()}")
+    return moving_image_resampled
 
 def normalize_image(image):
     """Normalize image intensities to mean 0 and variance 1."""
@@ -221,21 +274,31 @@ def perform_initial_registration(fixed_image, moving_image, transform_type='eule
             log.info(f"Using {transform_type} transform with {len(initial_transform.GetParameters())} parameters")
             
             # Set optimizer for linear transforms
-            registration.SetOptimizerAsGradientDescent(
-                learningRate=1.0,
-                numberOfIterations=100,
-                convergenceMinimumValue=1e-6,
-                convergenceWindowSize=10)
+            
+            #registration.SetOptimizerAsGradientDescent(
+            #    learningRate=0.5,
+            #    numberOfIterations=250,
+            #    convergenceMinimumValue=1e-6,
+            #    convergenceWindowSize=20
+            #    )
+            
+            registration.SetOptimizerAsRegularStepGradientDescent(
+                learningRate=0.5, minStep=1e-5, numberOfIterations=250,
+                relaxationFactor=0.75, gradientMagnitudeTolerance=1e-4)
+            
             registration.SetOptimizerScalesFromPhysicalShift()
         
         registration.SetInitialTransform(initial_transform)
         
         # Set up similarity metric
-        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-        registration.SetMetricSamplingStrategy(registration.RANDOM)
-        registration.SetMetricSamplingPercentage(0.01, seed=42)
+        registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=200)
+        # registration.SetMetricSamplingStrategy(registration.RANDOM)
+        # registration.SetMetricSamplingPercentage(0.20, seed=42)
         
         registration.SetInterpolator(sitk.sitkLinear)
+        
+        registration.MetricUseFixedImageGradientFilterOn()
+        registration.MetricUseMovingImageGradientFilterOn()
         
         # Add observers to track progress
         def command_iteration(method):
@@ -666,7 +729,48 @@ def ants_brain_extraction(input_path, output_path, image_modality="t1"):
         log.error(f"ANTs brain extraction failed: {str(e)}")
         log.info("Falling back to original image")
         return sitk.ReadImage(input_path)
+   
+def view_napari_images(mri_image, mra_image):
+    mri_array  = sitk.GetArrayFromImage(mri_image)
+    mra_array  = sitk.GetArrayFromImage(mra_image)
+
+    # Create a Napari viewer and add each as a layer
+    viewer = napari.Viewer()
+    viewer.add_image(
+        mri_array,
+        name='MRI (reference)',
+        blending='additive',
+        opacity=0.6
+    )
+    viewer.add_image(
+        mra_array,
+        name='MRA (moving)',
+        blending='additive',
+        opacity=0.4
+    )
+
+    # Launch Napari event loop
+    napari.run()
     
+def check_rotational_alignment(mri_image, mra_image):
+    # Get direction matrices (3x3 rotation matrices)
+    fixed_dir = np.array(mri_image.GetDirection()).reshape(3, 3)
+    moving_dir = np.array(mra_image.GetDirection()).reshape(3, 3)
+
+    # Extract axes for fixed and moving images
+    fixed_axes = fixed_dir.T  # Rows are X, Y, Z axes
+    moving_axes = moving_dir.T  # Rows are X, Y, Z axes
+
+    # Compute initial angular deviations for all three planes
+    initial_angles = {}
+    for i, plane in enumerate(['X (Left/Right)', 'Y (Anterior/Posterior)', 'Z (Superior/Inferior)']):
+        angle = np.arccos(np.clip(np.dot(fixed_axes[i], moving_axes[i]), -1.0, 1.0))
+        initial_angles[plane] = np.degrees(angle)
+
+    log.info("Initial Rotational Angle Deviations:")
+    for plane, angle in initial_angles.items():
+        log.info(f"{plane}: {angle:.2f} degrees")    
+        
 @click.command()
 @click.option('--mri', required=True, type=click.Path(exists=True), help='Path to the reference MRI file (.nii.gz)')
 @click.option('--mra', required=True, type=click.Path(exists=True), help='Path to the moving MRA file (.nii.gz)')
@@ -705,7 +809,9 @@ def main(mri, mra, output, patient_mrn, initial_transform, initial_spacing, fina
     # Ensure both images are in same coordinate reference space
     mri_image = sitk.DICOMOrient(mri_image, "LPS")
     mra_image = sitk.DICOMOrient(mra_image, "LPS")
-    
+    check_rotational_alignment(mri_image, mra_image)
+    # view_napari_images(mri_image, mra_image) # DEBUGGING purposes to check orientation
+        
     # Read in centroids of Trigeminal Nerve
     centroids_list = read_centroid_locations(centroid_locations, patient_mrn, mri_image)
     if not centroids_list:
@@ -716,7 +822,12 @@ def main(mri, mra, output, patient_mrn, initial_transform, initial_spacing, fina
             log.info(f"Centroid {idx + 1}: {centroid}")
     
     # Resample MRA to match MRI resolution
+    # mra_resampled = resample_to_reference_centered(mra_image, mri_image)
     mra_resampled = resample_to_reference(mra_image, mri_image)
+    # mra_resampled = mra_image
+    view_napari_images(mri_image, mra_resampled) # DEBUGGING purposes to check resampling quality
+    
+    check_rotational_alignment(mri_image, mra_resampled)
     
     # Run N4BiasField Correction (MRI → skull-included)
     preprocess_mri_path = os.path.join(os.path.dirname(mri), "preprocess_image", "n4bias_preprocess_mri.nii.gz")
@@ -734,9 +845,9 @@ def main(mri, mra, output, patient_mrn, initial_transform, initial_spacing, fina
         log.info("Brain extraction disabled. Using N4-corrected skull-included MRI.")
         brain_mri_image = preprocess_mri_image
 
-    # Preprocess MRA
     preprocess_mra_image = n4bias_field_preprocess(mra_resampled, mra, "mra")
-
+    preprocess_mra_image = mra_resampled # DEBUGGING PURPOSES
+    
     # Normalize images
     log.info("Normalizing images...")
     mri_norm = normalize_image(brain_mri_image)
@@ -748,6 +859,8 @@ def main(mri, mra, output, patient_mrn, initial_transform, initial_spacing, fina
         transform_type=initial_transform,
         grid_spacing=initial_spacing
     )
+    
+    # view_napari_images(mri_norm, initial_result) # DEBUGGING purposes
     
     if initial_result is None:
         log.info("Initial registration failed. Exiting...")

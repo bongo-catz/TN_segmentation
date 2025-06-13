@@ -15,3 +15,4 @@ dependencies:
     - antspyx # For brain extraction
     - antspynet 
     - itk
+    - napari
